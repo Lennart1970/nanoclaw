@@ -192,6 +192,49 @@ function resolvePrimaryJid(jid: string): string {
   return linkedToPrimary[jid] || jid;
 }
 
+/**
+ * Deterministic message bridge: forwards a user message to all linked channels
+ * without invoking the agent. Zero tokens, near-instant delivery.
+ */
+function bridgeMessageToLinkedChannels(
+  sourceJid: string,
+  msg: NewMessage,
+): void {
+  // Find which group this JID belongs to and all its linked JIDs
+  const primaryJid = resolvePrimaryJid(sourceJid);
+  const linkedJids = channelLinksMap[primaryJid];
+  if (!linkedJids?.length && sourceJid === primaryJid) return;
+
+  // Collect all JIDs in this group except the source
+  const targetJids: string[] = [];
+  if (sourceJid !== primaryJid) {
+    targetJids.push(primaryJid);
+  }
+  for (const jid of linkedJids || []) {
+    if (jid !== sourceJid) {
+      targetJids.push(jid);
+    }
+  }
+  if (targetJids.length === 0) return;
+
+  // Determine source channel name for attribution
+  const sourceChannel = findChannel(channels, sourceJid);
+  const tag = sourceChannel?.name || 'unknown';
+  const bridgedText = `[${tag}] ${msg.sender_name}: ${msg.content}`;
+
+  for (const targetJid of targetJids) {
+    const ch = findChannel(channels, targetJid);
+    if (ch?.isConnected()) {
+      ch.sendMessage(targetJid, bridgedText).catch((err) =>
+        logger.warn(
+          { sourceJid, targetJid, err },
+          'Failed to bridge message to linked channel',
+        ),
+      );
+    }
+  }
+}
+
 export function linkChannel(primaryJid: string, linkedJid: string): void {
   addChannelLink(primaryJid, linkedJid);
   loadChannelLinks();
@@ -314,7 +357,10 @@ async function processGroupMessages(chatJid: string): Promise<boolean> {
 
   const channel = findChannel(channels, primaryJid);
   if (!channel) {
-    logger.warn({ chatJid: primaryJid }, 'No channel owns JID, skipping messages');
+    logger.warn(
+      { chatJid: primaryJid },
+      'No channel owns JID, skipping messages',
+    );
     return true;
   }
 
@@ -823,6 +869,12 @@ async function main(): Promise<void> {
         }
       }
       storeMessage(msg);
+
+      // Deterministic channel bridge: forward user messages to linked channels
+      // instantly — no agent, no tokens, just code.
+      if (!msg.is_from_me && !msg.is_bot_message) {
+        bridgeMessageToLinkedChannels(chatJid, msg);
+      }
     },
     onChatMetadata: (
       chatJid: string,
@@ -866,7 +918,10 @@ async function main(): Promise<void> {
       const primaryJid = resolvePrimaryJid(jid);
       const channel = findChannel(channels, primaryJid);
       if (!channel) {
-        logger.warn({ jid: primaryJid }, 'No channel owns JID, cannot send message');
+        logger.warn(
+          { jid: primaryJid },
+          'No channel owns JID, cannot send message',
+        );
         return;
       }
       const text = formatOutbound(rawText);
