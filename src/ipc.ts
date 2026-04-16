@@ -22,6 +22,9 @@ export interface IpcDeps {
     availableGroups: AvailableGroup[],
     registeredJids: Set<string>,
   ) => void;
+  linkChannel: (primaryJid: string, linkedJid: string) => void;
+  unlinkChannel: (primaryJid: string, linkedJid: string) => void;
+  getChannelLinks: () => Record<string, string[]>;
   onTasksChanged: () => void;
 }
 
@@ -173,6 +176,9 @@ export async function processTaskIpc(
     trigger?: string;
     requiresTrigger?: boolean;
     containerConfig?: RegisteredGroup['containerConfig'];
+    // For link_channel / unlink_channel
+    primaryJid?: string;
+    linkedJid?: string;
   },
   sourceGroup: string, // Verified identity from IPC directory
   isMain: boolean, // Verified from directory path
@@ -458,6 +464,57 @@ export async function processTaskIpc(
         logger.warn(
           { data },
           'Invalid register_group request - missing required fields',
+        );
+      }
+      break;
+
+    case 'link_channel':
+      if (!isMain) {
+        logger.warn(
+          { sourceGroup },
+          'Unauthorized link_channel attempt blocked',
+        );
+        break;
+      }
+      if (data.primaryJid && data.linkedJid) {
+        if (!registeredGroups[data.primaryJid]) {
+          logger.warn(
+            { primaryJid: data.primaryJid },
+            'Cannot link: primary group not registered',
+          );
+          break;
+        }
+        deps.linkChannel(data.primaryJid, data.linkedJid);
+        logger.info(
+          { primaryJid: data.primaryJid, linkedJid: data.linkedJid },
+          'Channel linked via IPC',
+        );
+      } else {
+        logger.warn(
+          { data },
+          'Invalid link_channel request - missing primaryJid or linkedJid',
+        );
+      }
+      break;
+
+    case 'unlink_channel':
+      if (!isMain) {
+        logger.warn(
+          { sourceGroup },
+          'Unauthorized unlink_channel attempt blocked',
+        );
+        break;
+      }
+      if (data.primaryJid && data.linkedJid) {
+        deps.unlinkChannel(data.primaryJid, data.linkedJid);
+        logger.info(
+          { primaryJid: data.primaryJid, linkedJid: data.linkedJid },
+          'Channel unlinked via IPC',
+        );
+      } else {
+        logger.warn(
+          { data },
+          'Invalid unlink_channel request - missing primaryJid or linkedJid',
         );
       }
       break;

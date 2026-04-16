@@ -62,6 +62,9 @@ beforeEach(() => {
     syncGroups: async () => {},
     getAvailableGroups: () => [],
     writeGroupsSnapshot: () => {},
+    linkChannel: () => {},
+    unlinkChannel: () => {},
+    getChannelLinks: () => ({}),
     onTasksChanged: () => {},
   };
 });

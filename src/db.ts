@@ -113,6 +113,18 @@ function createSchema(database: Database.Database): void {
     /* column already exists */
   }
 
+  // Channel links table — mirrors messages between channels for the same group.
+  // primary_jid is the registered group JID; linked_jid is the mirror target.
+  database.exec(`
+    CREATE TABLE IF NOT EXISTS channel_links (
+      primary_jid TEXT NOT NULL,
+      linked_jid TEXT NOT NULL UNIQUE,
+      created_at TEXT NOT NULL,
+      PRIMARY KEY (primary_jid, linked_jid),
+      FOREIGN KEY (primary_jid) REFERENCES registered_groups(jid)
+    );
+  `);
+
   // Add is_main column if it doesn't exist (migration for existing DBs)
   try {
     database.exec(
@@ -697,6 +709,81 @@ export function getAllRegisteredGroups(): Record<string, RegisteredGroup> {
     };
   }
   return result;
+}
+
+// --- Channel link accessors ---
+
+export interface ChannelLink {
+  primary_jid: string;
+  linked_jid: string;
+  created_at: string;
+}
+
+export function addChannelLink(primaryJid: string, linkedJid: string): void {
+  db.prepare(
+    `INSERT OR REPLACE INTO channel_links (primary_jid, linked_jid, created_at) VALUES (?, ?, ?)`,
+  ).run(primaryJid, linkedJid, new Date().toISOString());
+}
+
+export function removeChannelLink(
+  primaryJid: string,
+  linkedJid: string,
+): void {
+  db.prepare(
+    `DELETE FROM channel_links WHERE primary_jid = ? AND linked_jid = ?`,
+  ).run(primaryJid, linkedJid);
+}
+
+export function getLinkedJids(primaryJid: string): string[] {
+  const rows = db
+    .prepare(`SELECT linked_jid FROM channel_links WHERE primary_jid = ?`)
+    .all(primaryJid) as Array<{ linked_jid: string }>;
+  return rows.map((r) => r.linked_jid);
+}
+
+export function getPrimaryJid(linkedJid: string): string | undefined {
+  const row = db
+    .prepare(`SELECT primary_jid FROM channel_links WHERE linked_jid = ?`)
+    .get(linkedJid) as { primary_jid: string } | undefined;
+  return row?.primary_jid;
+}
+
+export function getAllChannelLinks(): ChannelLink[] {
+  return db
+    .prepare(`SELECT primary_jid, linked_jid, created_at FROM channel_links`)
+    .all() as ChannelLink[];
+}
+
+/**
+ * Fetch messages from multiple chat JIDs since a given timestamp.
+ * Used by channel mirroring to aggregate messages from linked channels.
+ */
+export function getMessagesSinceMulti(
+  chatJids: string[],
+  sinceTimestamp: string,
+  botPrefix: string,
+  limit: number = 200,
+): NewMessage[] {
+  if (chatJids.length === 0) return [];
+  if (chatJids.length === 1)
+    return getMessagesSince(chatJids[0], sinceTimestamp, botPrefix, limit);
+
+  const placeholders = chatJids.map(() => '?').join(',');
+  const sql = `
+    SELECT * FROM (
+      SELECT id, chat_jid, sender, sender_name, content, timestamp, is_from_me,
+             reply_to_message_id, reply_to_message_content, reply_to_sender_name
+      FROM messages
+      WHERE chat_jid IN (${placeholders}) AND timestamp > ?
+        AND is_bot_message = 0 AND content NOT LIKE ?
+        AND content != '' AND content IS NOT NULL
+      ORDER BY timestamp DESC
+      LIMIT ?
+    ) ORDER BY timestamp
+  `;
+  return db
+    .prepare(sql)
+    .all(...chatJids, sinceTimestamp, `${botPrefix}:%`, limit) as NewMessage[];
 }
 
 // --- JSON migration ---

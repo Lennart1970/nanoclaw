@@ -30,16 +30,19 @@ import {
   ensureContainerRuntimeRunning,
 } from './container-runtime.js';
 import {
+  addChannelLink,
   getAllChats,
+  getAllChannelLinks,
   getAllRegisteredGroups,
   getAllSessions,
   deleteSession,
   getAllTasks,
   getLastBotMessageTimestamp,
-  getMessagesSince,
+  getMessagesSinceMulti,
   getNewMessages,
   getRouterState,
   initDatabase,
+  removeChannelLink,
   setRegisteredGroup,
   setRouterState,
   setSession,
@@ -74,6 +77,10 @@ let sessions: Record<string, string> = {};
 let registeredGroups: Record<string, RegisteredGroup> = {};
 let lastAgentTimestamp: Record<string, string> = {};
 let messageLoopRunning = false;
+
+// Channel mirroring state: primary_jid → linked_jid[], and reverse lookup
+let channelLinksMap: Record<string, string[]> = {};
+let linkedToPrimary: Record<string, string> = {};
 
 const channels: Channel[] = [];
 const queue = new GroupQueue();
@@ -110,10 +117,91 @@ function loadState(): void {
   }
   sessions = getAllSessions();
   registeredGroups = getAllRegisteredGroups();
+  loadChannelLinks();
   logger.info(
     { groupCount: Object.keys(registeredGroups).length },
     'State loaded',
   );
+}
+
+function loadChannelLinks(): void {
+  channelLinksMap = {};
+  linkedToPrimary = {};
+  for (const link of getAllChannelLinks()) {
+    if (!channelLinksMap[link.primary_jid]) {
+      channelLinksMap[link.primary_jid] = [];
+    }
+    channelLinksMap[link.primary_jid].push(link.linked_jid);
+    linkedToPrimary[link.linked_jid] = link.primary_jid;
+  }
+  const linkCount = Object.values(channelLinksMap).reduce(
+    (n, arr) => n + arr.length,
+    0,
+  );
+  if (linkCount > 0) {
+    logger.info({ linkCount }, 'Channel links loaded');
+  }
+}
+
+/**
+ * Returns registered groups augmented with linked channel JIDs.
+ * Linked JIDs map to the primary group's config so channels accept messages for them.
+ */
+function getEffectiveRegisteredGroups(): Record<string, RegisteredGroup> {
+  const effective = { ...registeredGroups };
+  for (const [primaryJid, linkedJids] of Object.entries(channelLinksMap)) {
+    const primaryGroup = registeredGroups[primaryJid];
+    if (!primaryGroup) continue;
+    for (const linkedJid of linkedJids) {
+      if (!effective[linkedJid]) {
+        effective[linkedJid] = { ...primaryGroup };
+      }
+    }
+  }
+  return effective;
+}
+
+/**
+ * Send a message to the primary channel and all linked mirror channels.
+ */
+async function sendToGroup(primaryJid: string, text: string): Promise<void> {
+  const ch = findChannel(channels, primaryJid);
+  if (ch?.isConnected()) {
+    await ch.sendMessage(primaryJid, text);
+  }
+  for (const linkedJid of channelLinksMap[primaryJid] || []) {
+    const lc = findChannel(channels, linkedJid);
+    if (lc?.isConnected()) {
+      try {
+        await lc.sendMessage(linkedJid, text);
+      } catch (err) {
+        logger.warn(
+          { linkedJid, err },
+          'Failed to mirror message to linked channel',
+        );
+      }
+    }
+  }
+}
+
+/**
+ * Resolve a JID to its primary group JID if it's a linked channel,
+ * otherwise return it unchanged.
+ */
+function resolvePrimaryJid(jid: string): string {
+  return linkedToPrimary[jid] || jid;
+}
+
+export function linkChannel(primaryJid: string, linkedJid: string): void {
+  addChannelLink(primaryJid, linkedJid);
+  loadChannelLinks();
+  logger.info({ primaryJid, linkedJid }, 'Channel linked');
+}
+
+export function unlinkChannel(primaryJid: string, linkedJid: string): void {
+  removeChannelLink(primaryJid, linkedJid);
+  loadChannelLinks();
+  logger.info({ primaryJid, linkedJid }, 'Channel unlinked');
 }
 
 /**
@@ -219,20 +307,25 @@ export function _setRegisteredGroups(
  * Called by the GroupQueue when it's this group's turn.
  */
 async function processGroupMessages(chatJid: string): Promise<boolean> {
-  const group = registeredGroups[chatJid];
+  // Resolve to primary JID if this is a linked channel
+  const primaryJid = resolvePrimaryJid(chatJid);
+  const group = registeredGroups[primaryJid];
   if (!group) return true;
 
-  const channel = findChannel(channels, chatJid);
+  const channel = findChannel(channels, primaryJid);
   if (!channel) {
-    logger.warn({ chatJid }, 'No channel owns JID, skipping messages');
+    logger.warn({ chatJid: primaryJid }, 'No channel owns JID, skipping messages');
     return true;
   }
 
   const isMainGroup = group.isMain === true;
 
-  const missedMessages = getMessagesSince(
-    chatJid,
-    getOrRecoverCursor(chatJid),
+  // Fetch messages from primary and all linked channels
+  const allJids = [primaryJid, ...(channelLinksMap[primaryJid] || [])];
+  const cursor = getOrRecoverCursor(primaryJid);
+  const missedMessages = getMessagesSinceMulti(
+    allJids,
+    cursor,
     ASSISTANT_NAME,
     MAX_MESSAGES_PER_PROMPT,
   );
@@ -246,17 +339,22 @@ async function processGroupMessages(chatJid: string): Promise<boolean> {
     const hasTrigger = missedMessages.some(
       (m) =>
         triggerPattern.test(m.content.trim()) &&
-        (m.is_from_me || isTriggerAllowed(chatJid, m.sender, allowlistCfg)),
+        (m.is_from_me || isTriggerAllowed(primaryJid, m.sender, allowlistCfg)),
     );
     if (!hasTrigger) return true;
+  }
+
+  // Add channel attribution for messages from linked channels
+  if (channelLinksMap[primaryJid]?.length) {
+    addChannelAttribution(missedMessages, primaryJid);
   }
 
   const prompt = formatMessages(missedMessages, TIMEZONE);
 
   // Advance cursor so the piping path in startMessageLoop won't re-fetch
   // these messages. Save the old cursor so we can roll back on error.
-  const previousCursor = lastAgentTimestamp[chatJid] || '';
-  lastAgentTimestamp[chatJid] =
+  const previousCursor = lastAgentTimestamp[primaryJid] || '';
+  lastAgentTimestamp[primaryJid] =
     missedMessages[missedMessages.length - 1].timestamp;
   saveState();
 
@@ -275,15 +373,15 @@ async function processGroupMessages(chatJid: string): Promise<boolean> {
         { group: group.name },
         'Idle timeout, closing container stdin',
       );
-      queue.closeStdin(chatJid);
+      queue.closeStdin(primaryJid);
     }, IDLE_TIMEOUT);
   };
 
-  await channel.setTyping?.(chatJid, true);
+  setGroupTyping(primaryJid, true);
   let hadError = false;
   let outputSentToUser = false;
 
-  const output = await runAgent(group, prompt, chatJid, async (result) => {
+  const output = await runAgent(group, prompt, primaryJid, async (result) => {
     // Streaming output callback — called for each agent result
     if (result.result) {
       const raw =
@@ -294,7 +392,7 @@ async function processGroupMessages(chatJid: string): Promise<boolean> {
       const text = raw.replace(/<internal>[\s\S]*?<\/internal>/g, '').trim();
       logger.info({ group: group.name }, `Agent output: ${raw.length} chars`);
       if (text) {
-        await channel.sendMessage(chatJid, text);
+        await sendToGroup(primaryJid, text);
         outputSentToUser = true;
       }
       // Only reset idle timer on actual results, not session-update markers (result: null)
@@ -302,7 +400,7 @@ async function processGroupMessages(chatJid: string): Promise<boolean> {
     }
 
     if (result.status === 'success') {
-      queue.notifyIdle(chatJid);
+      queue.notifyIdle(primaryJid);
     }
 
     if (result.status === 'error') {
@@ -310,7 +408,7 @@ async function processGroupMessages(chatJid: string): Promise<boolean> {
     }
   });
 
-  await channel.setTyping?.(chatJid, false);
+  setGroupTyping(primaryJid, false);
   if (idleTimer) clearTimeout(idleTimer);
 
   if (output === 'error' || hadError) {
@@ -324,7 +422,7 @@ async function processGroupMessages(chatJid: string): Promise<boolean> {
       return true;
     }
     // Roll back cursor so retries can re-process these messages
-    lastAgentTimestamp[chatJid] = previousCursor;
+    lastAgentTimestamp[primaryJid] = previousCursor;
     saveState();
     logger.warn(
       { group: group.name },
@@ -449,7 +547,8 @@ async function startMessageLoop(): Promise<void> {
 
   while (true) {
     try {
-      const jids = Object.keys(registeredGroups);
+      const effectiveGroups = getEffectiveRegisteredGroups();
+      const jids = Object.keys(effectiveGroups);
       const { messages, newTimestamp } = getNewMessages(
         jids,
         lastTimestamp,
@@ -463,24 +562,36 @@ async function startMessageLoop(): Promise<void> {
         lastTimestamp = newTimestamp;
         saveState();
 
-        // Deduplicate by group
-        const messagesByGroup = new Map<string, NewMessage[]>();
+        // Group by chat_jid, then merge linked JIDs into their primary group
+        const messagesByJid = new Map<string, NewMessage[]>();
         for (const msg of messages) {
-          const existing = messagesByGroup.get(msg.chat_jid);
+          const existing = messagesByJid.get(msg.chat_jid);
           if (existing) {
             existing.push(msg);
           } else {
-            messagesByGroup.set(msg.chat_jid, [msg]);
+            messagesByJid.set(msg.chat_jid, [msg]);
           }
         }
 
-        for (const [chatJid, groupMessages] of messagesByGroup) {
-          const group = registeredGroups[chatJid];
+        // Merge linked channel messages into primary group buckets
+        const messagesByGroup = new Map<string, NewMessage[]>();
+        for (const [chatJid, msgs] of messagesByJid) {
+          const primaryJid = resolvePrimaryJid(chatJid);
+          const existing = messagesByGroup.get(primaryJid) || [];
+          existing.push(...msgs);
+          messagesByGroup.set(primaryJid, existing);
+        }
+
+        for (const [primaryJid, groupMessages] of messagesByGroup) {
+          const group = registeredGroups[primaryJid];
           if (!group) continue;
 
-          const channel = findChannel(channels, chatJid);
+          const channel = findChannel(channels, primaryJid);
           if (!channel) {
-            logger.warn({ chatJid }, 'No channel owns JID, skipping messages');
+            logger.warn(
+              { chatJid: primaryJid },
+              'No channel owns JID, skipping messages',
+            );
             continue;
           }
 
@@ -497,40 +608,46 @@ async function startMessageLoop(): Promise<void> {
               (m) =>
                 triggerPattern.test(m.content.trim()) &&
                 (m.is_from_me ||
-                  isTriggerAllowed(chatJid, m.sender, allowlistCfg)),
+                  isTriggerAllowed(primaryJid, m.sender, allowlistCfg)),
             );
             if (!hasTrigger) continue;
           }
 
-          // Pull all messages since lastAgentTimestamp so non-trigger
-          // context that accumulated between triggers is included.
-          const allPending = getMessagesSince(
-            chatJid,
-            getOrRecoverCursor(chatJid),
+          // Pull all messages since lastAgentTimestamp from primary
+          // and all linked channels so accumulated context is included.
+          const allJids = [primaryJid, ...(channelLinksMap[primaryJid] || [])];
+          const cursor = getOrRecoverCursor(primaryJid);
+          const allPending = getMessagesSinceMulti(
+            allJids,
+            cursor,
             ASSISTANT_NAME,
             MAX_MESSAGES_PER_PROMPT,
           );
+
           const messagesToSend =
             allPending.length > 0 ? allPending : groupMessages;
+
+          // Add channel attribution for messages from linked channels
+          const linkedJids = channelLinksMap[primaryJid];
+          if (linkedJids?.length) {
+            addChannelAttribution(messagesToSend, primaryJid);
+          }
+
           const formatted = formatMessages(messagesToSend, TIMEZONE);
 
-          if (queue.sendMessage(chatJid, formatted)) {
+          if (queue.sendMessage(primaryJid, formatted)) {
             logger.debug(
-              { chatJid, count: messagesToSend.length },
+              { chatJid: primaryJid, count: messagesToSend.length },
               'Piped messages to active container',
             );
-            lastAgentTimestamp[chatJid] =
+            lastAgentTimestamp[primaryJid] =
               messagesToSend[messagesToSend.length - 1].timestamp;
             saveState();
-            // Show typing indicator while the container processes the piped message
-            channel
-              .setTyping?.(chatJid, true)
-              ?.catch((err) =>
-                logger.warn({ chatJid, err }, 'Failed to set typing indicator'),
-              );
+            // Show typing indicator on primary and linked channels
+            setGroupTyping(primaryJid, true);
           } else {
             // No active container — enqueue for a new one
-            queue.enqueueMessageCheck(chatJid);
+            queue.enqueueMessageCheck(primaryJid);
           }
         }
       }
@@ -542,13 +659,51 @@ async function startMessageLoop(): Promise<void> {
 }
 
 /**
+ * Tag sender names with channel attribution for messages from linked channels.
+ * Only mutates sender_name for non-bot messages from a different channel.
+ */
+function addChannelAttribution(
+  messages: NewMessage[],
+  primaryJid: string,
+): void {
+  for (const msg of messages) {
+    if (msg.chat_jid !== primaryJid && !msg.is_bot_message && !msg.is_from_me) {
+      const sourceChannel = findChannel(channels, msg.chat_jid);
+      if (sourceChannel) {
+        msg.sender_name = `[${sourceChannel.name}] ${msg.sender_name}`;
+      }
+    }
+  }
+}
+
+/**
+ * Set typing indicator on primary channel and all linked mirror channels.
+ */
+function setGroupTyping(primaryJid: string, isTyping: boolean): void {
+  const ch = findChannel(channels, primaryJid);
+  ch?.setTyping?.(primaryJid, isTyping)?.catch((err) =>
+    logger.warn({ chatJid: primaryJid, err }, 'Failed to set typing indicator'),
+  );
+  for (const linkedJid of channelLinksMap[primaryJid] || []) {
+    const lc = findChannel(channels, linkedJid);
+    lc?.setTyping?.(linkedJid, isTyping)?.catch((err) =>
+      logger.warn(
+        { chatJid: linkedJid, err },
+        'Failed to set typing on linked channel',
+      ),
+    );
+  }
+}
+
+/**
  * Startup recovery: check for unprocessed messages in registered groups.
  * Handles crash between advancing lastTimestamp and processing messages.
  */
 function recoverPendingMessages(): void {
   for (const [chatJid, group] of Object.entries(registeredGroups)) {
-    const pending = getMessagesSince(
-      chatJid,
+    const allJids = [chatJid, ...(channelLinksMap[chatJid] || [])];
+    const pending = getMessagesSinceMulti(
+      allJids,
       getOrRecoverCursor(chatJid),
       ASSISTANT_NAME,
       MAX_MESSAGES_PER_PROMPT,
@@ -646,12 +801,17 @@ async function main(): Promise<void> {
         return;
       }
 
+      // For linked channels, apply sender allowlist using the primary group's JID
+      const effectiveJid = resolvePrimaryJid(chatJid);
+      const effectiveGroup =
+        registeredGroups[effectiveJid] || registeredGroups[chatJid];
+
       // Sender allowlist drop mode: discard messages from denied senders before storing
-      if (!msg.is_from_me && !msg.is_bot_message && registeredGroups[chatJid]) {
+      if (!msg.is_from_me && !msg.is_bot_message && effectiveGroup) {
         const cfg = loadSenderAllowlist();
         if (
-          shouldDropMessage(chatJid, cfg) &&
-          !isSenderAllowed(chatJid, msg.sender, cfg)
+          shouldDropMessage(effectiveJid, cfg) &&
+          !isSenderAllowed(effectiveJid, msg.sender, cfg)
         ) {
           if (cfg.logDenied) {
             logger.debug(
@@ -671,7 +831,7 @@ async function main(): Promise<void> {
       channel?: string,
       isGroup?: boolean,
     ) => storeChatMetadata(chatJid, timestamp, name, channel, isGroup),
-    registeredGroups: () => registeredGroups,
+    registeredGroups: () => getEffectiveRegisteredGroups(),
   };
 
   // Create and connect all registered channels.
@@ -703,20 +863,20 @@ async function main(): Promise<void> {
     onProcess: (groupJid, proc, containerName, groupFolder) =>
       queue.registerProcess(groupJid, proc, containerName, groupFolder),
     sendMessage: async (jid, rawText) => {
-      const channel = findChannel(channels, jid);
+      const primaryJid = resolvePrimaryJid(jid);
+      const channel = findChannel(channels, primaryJid);
       if (!channel) {
-        logger.warn({ jid }, 'No channel owns JID, cannot send message');
+        logger.warn({ jid: primaryJid }, 'No channel owns JID, cannot send message');
         return;
       }
       const text = formatOutbound(rawText);
-      if (text) await channel.sendMessage(jid, text);
+      if (text) await sendToGroup(primaryJid, text);
     },
   });
   startIpcWatcher({
-    sendMessage: (jid, text) => {
-      const channel = findChannel(channels, jid);
-      if (!channel) throw new Error(`No channel for JID: ${jid}`);
-      return channel.sendMessage(jid, text);
+    sendMessage: async (jid, text) => {
+      const primaryJid = resolvePrimaryJid(jid);
+      await sendToGroup(primaryJid, text);
     },
     registeredGroups: () => registeredGroups,
     registerGroup,
@@ -730,6 +890,9 @@ async function main(): Promise<void> {
     getAvailableGroups,
     writeGroupsSnapshot: (gf, im, ag, rj) =>
       writeGroupsSnapshot(gf, im, ag, rj),
+    linkChannel,
+    unlinkChannel,
+    getChannelLinks: () => channelLinksMap,
     onTasksChanged: () => {
       const tasks = getAllTasks();
       const taskRows = tasks.map((t) => ({
