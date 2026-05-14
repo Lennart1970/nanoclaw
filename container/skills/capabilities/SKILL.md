@@ -59,6 +59,7 @@ Check for executable tools in the container:
 
 ```bash
 which agent-browser 2>/dev/null && echo "agent-browser: available" || echo "agent-browser: not found"
+which excel-reader 2>/dev/null && echo "excel-reader: available" || echo "excel-reader: not found"
 ```
 
 ### 5. Group info
@@ -88,6 +89,7 @@ Present the report as a clean, readable message. Example:
 
 *Container Tools:*
 • agent-browser: ✓
+• excel-reader: ✓
 
 *System:*
 • Group memory: yes/no

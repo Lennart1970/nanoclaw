@@ -725,10 +725,7 @@ export function addChannelLink(primaryJid: string, linkedJid: string): void {
   ).run(primaryJid, linkedJid, new Date().toISOString());
 }
 
-export function removeChannelLink(
-  primaryJid: string,
-  linkedJid: string,
-): void {
+export function removeChannelLink(primaryJid: string, linkedJid: string): void {
   db.prepare(
     `DELETE FROM channel_links WHERE primary_jid = ? AND linked_jid = ?`,
   ).run(primaryJid, linkedJid);

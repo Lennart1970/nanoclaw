@@ -34,6 +34,7 @@ import {
   setLastGroupSync,
   updateChatName,
 } from '../db.js';
+import { readEnvFile } from '../env.js';
 import { logger } from '../logger.js';
 import pino from 'pino';
 
@@ -48,6 +49,7 @@ import {
 import { registerChannel, ChannelOpts } from './registry.js';
 
 const GROUP_SYNC_INTERVAL_MS = 24 * 60 * 60 * 1000; // 24 hours
+const LID_MAP_FILE = path.join(STORE_DIR, 'lid-phone-map.json');
 
 export interface WhatsAppChannelOpts {
   onMessage: OnInboundMessage;
@@ -151,7 +153,11 @@ export class WhatsAppChannel implements Channel {
         exec(
           `osascript -e 'display notification "${msg}" with title "NanoClaw" sound name "Basso"'`,
         );
-        setTimeout(() => process.exit(1), 1000);
+        // Unblock connect() so other channels can start, then wait for re-auth.
+        if (this.pendingFirstOpen) {
+          this.pendingFirstOpen();
+          this.pendingFirstOpen = undefined;
+        }
       }
 
       if (connection === 'close') {
@@ -180,12 +186,22 @@ export class WhatsAppChannel implements Channel {
             }, 5000);
           });
         } else {
-          logger.info('Logged out. Run /setup to re-authenticate.');
-          process.exit(0);
+          logger.info(
+            'Logged out. Run /setup to re-authenticate. Other channels remain active.',
+          );
+          this.connected = false;
+          // Unblock connect() so the startup sequence and message loop can proceed.
+          if (this.pendingFirstOpen) {
+            this.pendingFirstOpen();
+            this.pendingFirstOpen = undefined;
+          }
         }
       } else if (connection === 'open') {
         this.connected = true;
         logger.info('Connected to WhatsApp');
+
+        // Load persisted + .env LID→phone mappings on every connect
+        this.loadLidPhoneMappings();
 
         // Announce availability so WhatsApp relays subsequent presence updates (typing indicators)
         this.sock.sendPresenceUpdate('available').catch((err) => {
@@ -232,7 +248,7 @@ export class WhatsAppChannel implements Channel {
 
     this.sock.ev.on('creds.update', saveCreds);
 
-    this.sock.ev.on('chats.phoneNumberShare', ({ lid, jid }) => {
+    (this.sock.ev as any).on('chats.phoneNumberShare', ({ lid, jid }: any) => {
       const lidUser = lid?.split('@')[0].split(':')[0];
       if (lidUser && jid) {
         this.setLidPhoneMapping(lidUser, jid);
@@ -489,6 +505,53 @@ export class WhatsAppChannel implements Channel {
     this.lidToPhoneMap[lidUser] = phoneJid;
     // Participant IDs in cached group metadata depend on this mapping.
     this.groupMetadataCache.clear();
+    // Persist new mapping so it survives restarts without needing .env edits.
+    this.persistLidPhoneMappings();
+  }
+
+  private persistLidPhoneMappings(): void {
+    try {
+      fs.writeFileSync(
+        LID_MAP_FILE,
+        JSON.stringify(this.lidToPhoneMap, null, 2),
+      );
+    } catch (err) {
+      logger.warn({ err }, 'Failed to persist LID→phone mappings');
+    }
+  }
+
+  private loadLidPhoneMappings(): void {
+    // 1. Load from persistent file (auto-discovered mappings from previous runs)
+    try {
+      const stored = JSON.parse(fs.readFileSync(LID_MAP_FILE, 'utf-8'));
+      for (const [lid, phone] of Object.entries(stored)) {
+        if (typeof phone === 'string') this.lidToPhoneMap[lid] = phone;
+      }
+      logger.info(
+        { count: Object.keys(stored).length },
+        'Loaded LID→phone mappings from file',
+      );
+    } catch {
+      // File doesn't exist yet — that's fine
+    }
+
+    // 2. Override/extend with LID_PHONE_MAP from .env (manual overrides take precedence)
+    const env = readEnvFile(['LID_PHONE_MAP']);
+    const raw = env['LID_PHONE_MAP'];
+    if (raw) {
+      let count = 0;
+      for (const pair of raw.split(',')) {
+        const [lid, phone] = pair.trim().split(':');
+        if (lid && phone) {
+          this.lidToPhoneMap[lid.trim()] = `${phone.trim()}@s.whatsapp.net`;
+          count++;
+        }
+      }
+      logger.info(
+        { count },
+        'Loaded LID→phone mappings from LID_PHONE_MAP env',
+      );
+    }
   }
 
   private async getNormalizedGroupMetadata(

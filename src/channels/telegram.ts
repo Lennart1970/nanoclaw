@@ -41,7 +41,12 @@ async function sendTelegramMessage(
   } catch (err) {
     // Fallback: send as plain text if Markdown parsing fails
     logger.debug({ err }, 'Markdown send failed, falling back to plain text');
-    await api.sendMessage(chatId, text, options);
+    try {
+      await api.sendMessage(chatId, text, options);
+    } catch (plainErr) {
+      logger.error({ plainErr }, 'Telegram plain-text fallback also failed');
+      throw plainErr;
+    }
   }
 }
 
@@ -51,6 +56,10 @@ export class TelegramChannel implements Channel {
   private bot: Bot | null = null;
   private opts: TelegramChannelOpts;
   private botToken: string;
+  private watchdogTimer: ReturnType<typeof setInterval> | null = null;
+  private lastUpdateAt: number = 0;
+  private static readonly WATCHDOG_INTERVAL_MS = 3 * 60 * 1000; // check every 3 min
+  private static readonly WATCHDOG_STALE_MS = 8 * 60 * 1000; // restart if silent for 8 min
 
   constructor(botToken: string, opts: TelegramChannelOpts) {
     this.botToken = botToken;
@@ -90,7 +99,10 @@ export class TelegramChannel implements Channel {
       const fileUrl = `https://api.telegram.org/file/bot${this.botToken}/${file.file_path}`;
       const resp = await fetch(fileUrl);
       if (!resp.ok) {
-        logger.warn({ fileId, status: resp.status }, 'Telegram file download failed');
+        logger.warn(
+          { fileId, status: resp.status },
+          'Telegram file download failed',
+        );
         return null;
       }
 
@@ -137,6 +149,8 @@ export class TelegramChannel implements Channel {
     const TELEGRAM_BOT_COMMANDS = new Set(['chatid', 'ping']);
 
     this.bot.on('message:text', async (ctx) => {
+      this.lastUpdateAt = Date.now();
+
       if (ctx.message.text.startsWith('/')) {
         const cmd = ctx.message.text.slice(1).split(/[\s@]/)[0].toLowerCase();
         if (TELEGRAM_BOT_COMMANDS.has(cmd)) return;
@@ -342,8 +356,11 @@ export class TelegramChannel implements Channel {
     });
 
     // Start polling — returns a Promise that resolves when started
-    return new Promise<void>((resolve) => {
+    await new Promise<void>((resolve) => {
       this.bot!.start({
+        // Drop accumulated updates from when the bot was offline to prevent
+        // the polling loop from getting stuck processing a large backlog.
+        drop_pending_updates: true,
         onStart: (botInfo) => {
           logger.info(
             { username: botInfo.username, id: botInfo.id },
@@ -353,10 +370,34 @@ export class TelegramChannel implements Channel {
           console.log(
             `  Send /chatid to the bot to get a chat's registration ID\n`,
           );
+          this.lastUpdateAt = Date.now();
           resolve();
         },
       });
     });
+
+    this.startWatchdog();
+  }
+
+  private startWatchdog(): void {
+    if (this.watchdogTimer) clearInterval(this.watchdogTimer);
+    this.watchdogTimer = setInterval(async () => {
+      if (!this.bot) return;
+      const staleSince = Date.now() - this.lastUpdateAt;
+      if (staleSince < TelegramChannel.WATCHDOG_STALE_MS) return;
+
+      logger.warn(
+        { staleSinceMs: staleSince },
+        'Telegram watchdog: polling appears stalled, reconnecting...',
+      );
+      try {
+        await this.disconnect();
+        await new Promise((r) => setTimeout(r, 2000));
+        await this.connect();
+      } catch (err) {
+        logger.error({ err }, 'Telegram watchdog: reconnect failed');
+      }
+    }, TelegramChannel.WATCHDOG_INTERVAL_MS);
   }
 
   async sendMessage(
@@ -407,6 +448,10 @@ export class TelegramChannel implements Channel {
   }
 
   async disconnect(): Promise<void> {
+    if (this.watchdogTimer) {
+      clearInterval(this.watchdogTimer);
+      this.watchdogTimer = null;
+    }
     if (this.bot) {
       this.bot.stop();
       this.bot = null;
